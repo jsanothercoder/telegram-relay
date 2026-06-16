@@ -7,6 +7,7 @@ import re
 import atexit
 import asyncio
 from telethon import TelegramClient
+from telethon import functions
 from telethon.errors import SessionPasswordNeededError, PhoneCodeInvalidError
 
 app = Flask(__name__)
@@ -22,6 +23,7 @@ CONTROL_KEY = os.environ.get("CONTROL_KEY", "")
 
 API_ID = int(os.environ.get("TG_API_ID", "0"))
 API_HASH = os.environ.get("TG_API_HASH", "")
+FORCE_SMS = os.environ.get("TG_FORCE_SMS", "false").strip().lower() in ("1", "true", "yes", "on")
 
 SESSIONS_DIR = os.environ.get("SESSIONS_DIR", "./tg_sessions")
 os.makedirs(SESSIONS_DIR, exist_ok=True)
@@ -196,6 +198,25 @@ def sent_code_debug(result):
     return code_type, next_type, timeout
 
 
+def save_wait_code_session(player_id, client, phone, result, loop):
+    phone_code_hash = result.phone_code_hash
+    code_type, next_type, timeout = sent_code_debug(result)
+
+    with auth_lock:
+        auth_sessions[player_id] = {
+            "client": client,
+            "phone": phone,
+            "phone_code_hash": phone_code_hash,
+            "state": "wait_code",
+            "loop": loop,
+            "code_type": code_type,
+            "next_type": next_type,
+            "timeout": timeout,
+        }
+
+    return code_type, next_type, timeout
+
+
 @app.route("/auth/start", methods=["POST"])
 def auth_start():
     if not require_secret():
@@ -207,7 +228,7 @@ def auth_start():
 
     print(
         f"/auth/start called: player_id={player_id!r}, phone={phone!r}, "
-        f"api_id_set={bool(API_ID)}, api_hash_set={bool(API_HASH)}",
+        f"api_id_set={bool(API_ID)}, api_hash_set={bool(API_HASH)}, force_sms={FORCE_SMS}",
         flush=True,
     )
 
@@ -228,20 +249,10 @@ def auth_start():
 
         async def do_start():
             await client.connect()
-            return await client.send_code_request(phone)
+            return await client.send_code_request(phone, force_sms=FORCE_SMS)
 
         result = run_async(player_id, do_start())
-        phone_code_hash = result.phone_code_hash
-        code_type, next_type, timeout = sent_code_debug(result)
-
-        with auth_lock:
-            auth_sessions[player_id] = {
-                "client": client,
-                "phone": phone,
-                "phone_code_hash": phone_code_hash,
-                "state": "wait_code",
-                "loop": loop,
-            }
+        code_type, next_type, timeout = save_wait_code_session(player_id, client, phone, result, loop)
 
         print(
             f"Auth started for player {player_id}, phone={phone!r}, "
@@ -256,6 +267,69 @@ def auth_start():
         })
     except Exception as e:
         print(f"auth_start error for player={player_id!r}, phone={phone!r}: {repr(e)}", flush=True)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/auth/resend", methods=["POST"])
+def auth_resend():
+    if not require_secret():
+        return jsonify({"error": "unauthorized"}), 401
+
+    data = request.get_json(silent=True) or {}
+    player_id = data.get("player_id", "").strip()
+
+    if not player_id:
+        return jsonify({"error": "player_id required"}), 400
+
+    with auth_lock:
+        sess = auth_sessions.get(player_id)
+
+    if not sess:
+        return jsonify({"error": "no_session", "hint": "Сначала /tgauth number"}), 400
+    if sess.get("state") == "authorized":
+        return jsonify({"status": "already_authorized"})
+    if sess.get("state") not in ("wait_code", "wait_password"):
+        return jsonify({"error": "unexpected_state", "state": sess.get("state")}), 400
+
+    phone = sess.get("phone", "")
+    old_hash = sess.get("phone_code_hash", "")
+    client = sess.get("client")
+    loop = sess.get("loop")
+
+    print(
+        f"/auth/resend called: player_id={player_id!r}, phone={phone!r}, "
+        f"old_code_type={sess.get('code_type')!r}, old_next_type={sess.get('next_type')!r}",
+        flush=True,
+    )
+
+    try:
+        async def do_resend():
+            try:
+                return await client(functions.auth.ResendCodeRequest(phone, old_hash))
+            except Exception as resend_error:
+                print(
+                    f"resend_code failed for player={player_id!r}: {repr(resend_error)}; "
+                    "trying send_code_request(force_sms=True)",
+                    flush=True,
+                )
+                return await client.send_code_request(phone, force_sms=True)
+
+        result = run_async(player_id, do_resend())
+        code_type, next_type, timeout = save_wait_code_session(player_id, client, phone, result, loop)
+
+        print(
+            f"Auth code resent for player {player_id}, phone={phone!r}, "
+            f"code_type={code_type}, next_type={next_type}, timeout={timeout}",
+            flush=True,
+        )
+        return jsonify({
+            "status": "code_sent",
+            "code_type": code_type,
+            "next_type": next_type,
+            "timeout": timeout,
+        })
+    except Exception as e:
+        print(f"auth_resend error for player={player_id!r}, phone={phone!r}: {repr(e)}", flush=True)
         return jsonify({"error": str(e)}), 500
 
 

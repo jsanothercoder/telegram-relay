@@ -7,6 +7,7 @@ import re
 import atexit
 import asyncio
 from datetime import datetime, timezone
+from urllib.parse import quote
 from telethon import TelegramClient
 from telethon import functions
 from telethon.errors import SessionPasswordNeededError, PhoneCodeInvalidError
@@ -28,6 +29,10 @@ FORCE_SMS = os.environ.get("TG_FORCE_SMS", "true").strip().lower() in ("1", "tru
 
 SESSIONS_DIR = os.environ.get("SESSIONS_DIR", "./tg_sessions")
 os.makedirs(SESSIONS_DIR, exist_ok=True)
+QR_IMAGE_BASE = os.environ.get(
+    "QR_IMAGE_BASE",
+    "https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=",
+)
 
 if not TOKEN:
     raise RuntimeError("TELEGRAM_TOKEN is not set")
@@ -218,6 +223,22 @@ def save_wait_code_session(player_id, client, phone, result, loop):
     return code_type, next_type, timeout
 
 
+def make_qr_open_url(tg_url: str) -> str:
+    """HTTPS-ссылка на QR-картинку, которую можно открыть в браузере."""
+    if not tg_url:
+        return ""
+    return QR_IMAGE_BASE + quote(tg_url, safe="")
+
+
+def qr_response_fields(sess: dict) -> dict:
+    return {
+        "qr_url": sess.get("qr_open_url", ""),
+        "qr_open_url": sess.get("qr_open_url", ""),
+        "qr_token_url": sess.get("qr_token_url", ""),
+        "qr_expires": sess.get("qr_expires", ""),
+    }
+
+
 def _utc_iso(dt):
     if not dt:
         return ""
@@ -231,13 +252,15 @@ def _utc_iso(dt):
 
 
 def save_wait_qr_session(player_id, client, qr_login, loop):
+    token_url = getattr(qr_login, "url", "")
     with auth_lock:
         auth_sessions[player_id] = {
             "client": client,
             "state": "wait_qr",
             "loop": loop,
             "qr_login": qr_login,
-            "qr_url": getattr(qr_login, "url", ""),
+            "qr_token_url": token_url,
+            "qr_open_url": make_qr_open_url(token_url),
             "qr_expires": _utc_iso(getattr(qr_login, "expires", None)),
         }
 
@@ -277,7 +300,8 @@ def start_qr_waiter(player_id: str):
                     if player_id in auth_sessions:
                         auth_sessions[player_id]["state"] = "authorized"
                         auth_sessions[player_id].pop("qr_login", None)
-                        auth_sessions[player_id].pop("qr_url", None)
+                        auth_sessions[player_id].pop("qr_token_url", None)
+                        auth_sessions[player_id].pop("qr_open_url", None)
                         auth_sessions[player_id].pop("qr_expires", None)
                 print(f"Player {player_id} authorized via QR", flush=True)
                 return
@@ -287,7 +311,9 @@ def start_qr_waiter(player_id: str):
                     await qr.recreate()
                     with auth_lock:
                         if player_id in auth_sessions and auth_sessions[player_id].get("state") == "wait_qr":
-                            auth_sessions[player_id]["qr_url"] = getattr(qr, "url", "")
+                            token_url = getattr(qr, "url", "")
+                            auth_sessions[player_id]["qr_token_url"] = token_url
+                            auth_sessions[player_id]["qr_open_url"] = make_qr_open_url(token_url)
                             auth_sessions[player_id]["qr_expires"] = _utc_iso(getattr(qr, "expires", None))
                 except Exception as e:
                     print(f"qr recreate error for player={player_id!r}: {repr(e)}", flush=True)
@@ -374,8 +400,7 @@ def auth_qr_start():
         if sess.get("state") == "wait_qr":
             return jsonify({
                 "status": "qr_ready",
-                "qr_url": sess.get("qr_url", ""),
-                "qr_expires": sess.get("qr_expires", ""),
+                **qr_response_fields(sess),
             })
 
     try:
@@ -396,8 +421,7 @@ def auth_qr_start():
 
         return jsonify({
             "status": "qr_ready",
-            "qr_url": sess.get("qr_url", ""),
-            "qr_expires": sess.get("qr_expires", ""),
+            **qr_response_fields(sess),
         })
     except Exception as e:
         print(f"auth_qr_start error for player={player_id!r}: {repr(e)}", flush=True)
@@ -422,8 +446,7 @@ def auth_qr_status():
     state = sess.get("state", "none")
     out = {"player_id": player_id, "state": state}
     if state == "wait_qr":
-        out["qr_url"] = sess.get("qr_url", "")
-        out["qr_expires"] = sess.get("qr_expires", "")
+        out.update(qr_response_fields(sess))
     return jsonify(out)
 
 
@@ -570,7 +593,10 @@ def auth_status():
         sess = auth_sessions.get(player_id)
 
     state = sess.get("state", "none") if sess else "none"
-    return jsonify({"player_id": player_id, "state": state})
+    out = {"player_id": player_id, "state": state}
+    if sess and state == "wait_qr":
+        out.update(qr_response_fields(sess))
+    return jsonify(out)
 
 
 @app.route("/to-tg-user", methods=["POST"])

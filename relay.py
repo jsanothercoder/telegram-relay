@@ -14,17 +14,15 @@ app = Flask(__name__)
 tg_to_mc = []
 lock = threading.Lock()
 
-TOKEN        = os.environ.get("TELEGRAM_TOKEN")
-CHAT_ID      = str(os.environ.get("CHAT_ID", "")).strip().rstrip("L")
-SECRET_KEY   = os.environ.get("SECRET_KEY", "change_this_secret")
-CONTROL_URL  = os.environ.get("CONTROL_URL", "").rstrip("/")
-CONTROL_KEY  = os.environ.get("CONTROL_KEY", "")
+TOKEN = os.environ.get("TELEGRAM_TOKEN")
+CHAT_ID = str(os.environ.get("CHAT_ID", "")).strip().rstrip("L")
+SECRET_KEY = os.environ.get("SECRET_KEY", "change_this_secret")
+CONTROL_URL = os.environ.get("CONTROL_URL", "").rstrip("/")
+CONTROL_KEY = os.environ.get("CONTROL_KEY", "")
 
-# Telethon (MTProto) — получи на my.telegram.org
-API_ID       = int(os.environ.get("TG_API_ID", "0"))
-API_HASH     = os.environ.get("TG_API_HASH", "")
+API_ID = int(os.environ.get("TG_API_ID", "0"))
+API_HASH = os.environ.get("TG_API_HASH", "")
 
-# Папка для хранения сессий пользователей
 SESSIONS_DIR = os.environ.get("SESSIONS_DIR", "./tg_sessions")
 os.makedirs(SESSIONS_DIR, exist_ok=True)
 
@@ -33,34 +31,31 @@ if not TOKEN:
 if not CHAT_ID:
     raise RuntimeError("CHAT_ID is not set")
 
-# ── Хранилище сессий авторизации ─────────────────────────────────────────────
-# player_id → { "client": TelegramClient, "phone": str,
-#               "phone_code_hash": str, "loop": asyncio.Loop,
-#               "state": "wait_code" | "wait_password" | "authorized" }
 auth_sessions = {}
 auth_lock = threading.Lock()
 
-# ── Whitelist паттерны ────────────────────────────────────────────────────────
-WL_ADD_RE    = re.compile(r"^[!/]?whitelist\s+add\s+(\S+)$",    re.IGNORECASE)
+WL_ADD_RE = re.compile(r"^[!/]?whitelist\s+add\s+(\S+)$", re.IGNORECASE)
 WL_REMOVE_RE = re.compile(r"^[!/]?whitelist\s+remove\s+(\S+)$", re.IGNORECASE)
 
-poller_thread  = None
+poller_thread = None
 poller_started = False
-poller_stop    = threading.Event()
+poller_stop = threading.Event()
 
 
-# ── Telegram Bot API helpers ──────────────────────────────────────────────────
+def require_secret():
+    return request.headers.get("X-Secret-Key") == SECRET_KEY
+
 
 def disable_webhook():
     try:
         r = requests.post(
             f"https://api.telegram.org/bot{TOKEN}/deleteWebhook",
             json={"drop_pending_updates": False},
-            timeout=15
+            timeout=15,
         )
-        print("deleteWebhook:", r.status_code, r.text)
+        print("deleteWebhook:", r.status_code, r.text, flush=True)
     except Exception as e:
-        print("deleteWebhook error:", e)
+        print("deleteWebhook error:", repr(e), flush=True)
 
 
 def send_tg(text: str):
@@ -68,10 +63,10 @@ def send_tg(text: str):
         requests.post(
             f"https://api.telegram.org/bot{TOKEN}/sendMessage",
             json={"chat_id": CHAT_ID, "text": text, "parse_mode": "Markdown"},
-            timeout=10
+            timeout=10,
         )
     except Exception as e:
-        print("send_tg error:", e)
+        print("send_tg error:", repr(e), flush=True)
 
 
 def handle_whitelist(action: str, name: str) -> str:
@@ -82,7 +77,7 @@ def handle_whitelist(action: str, name: str) -> str:
             f"{CONTROL_URL}/api/whitelist/{action}",
             params={"name": name},
             headers={"X-Api-Key": CONTROL_KEY},
-            timeout=10
+            timeout=10,
         )
         data = r.json()
         return data.get("message", str(data))
@@ -90,11 +85,9 @@ def handle_whitelist(action: str, name: str) -> str:
         return f"⛔ Ошибка связи с сервером: {e}"
 
 
-# ── Polling бота ──────────────────────────────────────────────────────────────
-
 def poll_telegram():
     offset = 0
-    print(f"Telegram polling started (pid={os.getpid()})")
+    print(f"Telegram polling started (pid={os.getpid()})", flush=True)
     while not poller_stop.is_set():
         try:
             r = requests.get(
@@ -102,14 +95,18 @@ def poll_telegram():
                 params={
                     "offset": offset,
                     "timeout": 30,
-                    "allowed_updates": ["message", "edited_message",
-                                        "channel_post", "edited_channel_post"]
+                    "allowed_updates": [
+                        "message",
+                        "edited_message",
+                        "channel_post",
+                        "edited_channel_post",
+                    ],
                 },
-                timeout=35
+                timeout=35,
             )
             data = r.json()
             if not data.get("ok"):
-                print("getUpdates not ok:", data)
+                print("getUpdates not ok:", data, flush=True)
                 time.sleep(2)
                 continue
 
@@ -118,7 +115,7 @@ def poll_telegram():
                 if msg and "text" in msg:
                     chat_id = str(msg.get("chat", {}).get("id", "")).strip()
                     if chat_id == CHAT_ID:
-                        frm  = msg.get("from", {}) or {}
+                        frm = msg.get("from", {}) or {}
                         name = frm.get("username") or frm.get("first_name") or "TGUser"
                         text = msg.get("text", "")
 
@@ -126,24 +123,19 @@ def poll_telegram():
                         m_rem = WL_REMOVE_RE.match(text)
 
                         if m_add:
-                            player = m_add.group(1)
-                            result = handle_whitelist("add", player)
-                            send_tg(result)
+                            send_tg(handle_whitelist("add", m_add.group(1)))
                         elif m_rem:
-                            player = m_rem.group(1)
-                            result = handle_whitelist("remove", player)
-                            send_tg(result)
+                            send_tg(handle_whitelist("remove", m_rem.group(1)))
                         else:
                             with lock:
                                 tg_to_mc.append({"player": name, "message": text})
-                            print(f"Queued TG->MC: {name}: {text}")
+                            print(f"Queued TG->MC: {name}: {text}", flush=True)
                     else:
-                        print(f"Skipped chat_id={chat_id}")
+                        print(f"Skipped chat_id={chat_id}", flush=True)
 
                 offset = max(offset, upd["update_id"] + 1)
-
         except Exception as e:
-            print("Poll error:", e)
+            print("Poll error:", repr(e), flush=True)
             time.sleep(3)
 
 
@@ -160,9 +152,8 @@ def ensure_single_poller():
 @atexit.register
 def _shutdown():
     poller_stop.set()
-    # Закрываем все Telethon-сессии
     with auth_lock:
-        for pid, sess in auth_sessions.items():
+        for sess in auth_sessions.values():
             try:
                 client = sess.get("client")
                 loop = sess.get("loop")
@@ -172,10 +163,7 @@ def _shutdown():
                 pass
 
 
-# ── Telethon helpers ──────────────────────────────────────────────────────────
-
 def get_or_create_loop(player_id: str):
-    """Каждый игрок получает свой event loop в отдельном потоке."""
     with auth_lock:
         sess = auth_sessions.get(player_id, {})
         if "loop" in sess:
@@ -190,40 +178,44 @@ def get_or_create_loop(player_id: str):
         t = threading.Thread(target=run_loop, daemon=True, name=f"loop-{player_id}")
         t.start()
 
-        if player_id not in auth_sessions:
-            auth_sessions[player_id] = {}
-        auth_sessions[player_id]["loop"] = loop
+        auth_sessions.setdefault(player_id, {})["loop"] = loop
         return loop
 
 
 def run_async(player_id: str, coro):
-    """Запустить корутину в loop игрока и дождаться результата."""
     loop = get_or_create_loop(player_id)
     future = asyncio.run_coroutine_threadsafe(coro, loop)
-    return future.result(timeout=30)
+    return future.result(timeout=60)
 
 
-# ── Эндпоинты авторизации ─────────────────────────────────────────────────────
+def sent_code_debug(result):
+    code_type = type(getattr(result, "type", None)).__name__
+    next_type_obj = getattr(result, "next_type", None)
+    next_type = type(next_type_obj).__name__ if next_type_obj else "none"
+    timeout = getattr(result, "timeout", None)
+    return code_type, next_type, timeout
+
 
 @app.route("/auth/start", methods=["POST"])
 def auth_start():
-    """
-    Шаг 1: игрок вводит /tgauth number +79991234567
-    Тело: { "player_id": "uuid-игрока", "phone": "+79991234567" }
-    """
-    if request.headers.get("X-Secret-Key") != SECRET_KEY:
+    if not require_secret():
         return jsonify({"error": "unauthorized"}), 401
 
     data = request.get_json(silent=True) or {}
     player_id = data.get("player_id", "").strip()
     phone = data.get("phone", "").strip()
 
+    print(
+        f"/auth/start called: player_id={player_id!r}, phone={phone!r}, "
+        f"api_id_set={bool(API_ID)}, api_hash_set={bool(API_HASH)}",
+        flush=True,
+    )
+
     if not player_id or not phone:
         return jsonify({"error": "player_id and phone required"}), 400
     if not API_ID or not API_HASH:
         return jsonify({"error": "TG_API_ID / TG_API_HASH не заданы на сервере"}), 500
 
-    # Если уже авторизован — отвечаем сразу
     with auth_lock:
         sess = auth_sessions.get(player_id, {})
         if sess.get("state") == "authorized":
@@ -236,10 +228,11 @@ def auth_start():
 
         async def do_start():
             await client.connect()
-            result = await client.send_code_request(phone)
-            return result.phone_code_hash
+            return await client.send_code_request(phone)
 
-        phone_code_hash = run_async(player_id, do_start())
+        result = run_async(player_id, do_start())
+        phone_code_hash = result.phone_code_hash
+        code_type, next_type, timeout = sent_code_debug(result)
 
         with auth_lock:
             auth_sessions[player_id] = {
@@ -250,21 +243,25 @@ def auth_start():
                 "loop": loop,
             }
 
-        print(f"Auth started for player {player_id}, phone {phone}")
-        return jsonify({"status": "code_sent"})
-
+        print(
+            f"Auth started for player {player_id}, phone={phone!r}, "
+            f"code_type={code_type}, next_type={next_type}, timeout={timeout}",
+            flush=True,
+        )
+        return jsonify({
+            "status": "code_sent",
+            "code_type": code_type,
+            "next_type": next_type,
+            "timeout": timeout,
+        })
     except Exception as e:
-        print(f"auth_start error: {e}")
+        print(f"auth_start error for player={player_id!r}, phone={phone!r}: {repr(e)}", flush=True)
         return jsonify({"error": str(e)}), 500
 
 
 @app.route("/auth/code", methods=["POST"])
 def auth_code():
-    """
-    Шаг 2: игрок вводит /tgauth code 123456
-    Тело: { "player_id": "uuid", "code": "123456" }
-    """
-    if request.headers.get("X-Secret-Key") != SECRET_KEY:
+    if not require_secret():
         return jsonify({"error": "unauthorized"}), 401
 
     data = request.get_json(silent=True) or {}
@@ -281,6 +278,7 @@ def auth_code():
         return jsonify({"error": "no_session", "hint": "Сначала /tgauth number"}), 400
 
     state = sess.get("state")
+    print(f"/auth/code called: player_id={player_id!r}, state={state!r}", flush=True)
 
     if state == "authorized":
         return jsonify({"status": "already_authorized"})
@@ -291,29 +289,27 @@ def auth_code():
                 return await sess["client"].sign_in(
                     phone=sess["phone"],
                     code=code,
-                    phone_code_hash=sess["phone_code_hash"]
+                    phone_code_hash=sess["phone_code_hash"],
                 )
 
             run_async(player_id, do_sign_in())
             with auth_lock:
                 auth_sessions[player_id]["state"] = "authorized"
-            print(f"Player {player_id} authorized via code")
+            print(f"Player {player_id} authorized via code", flush=True)
             return jsonify({"status": "authorized"})
-
         except SessionPasswordNeededError:
             with auth_lock:
                 auth_sessions[player_id]["state"] = "wait_password"
+            print(f"Player {player_id} needs 2FA password", flush=True)
             return jsonify({"status": "need_password"})
-
         except PhoneCodeInvalidError:
+            print(f"Invalid code for player {player_id}", flush=True)
             return jsonify({"error": "invalid_code"}), 400
-
         except Exception as e:
-            print(f"auth_code error: {e}")
+            print(f"auth_code error for player={player_id!r}: {repr(e)}", flush=True)
             return jsonify({"error": str(e)}), 500
 
     if state == "wait_password":
-        # code здесь — это 2FA пароль
         try:
             async def do_password():
                 return await sess["client"].sign_in(password=code)
@@ -321,11 +317,10 @@ def auth_code():
             run_async(player_id, do_password())
             with auth_lock:
                 auth_sessions[player_id]["state"] = "authorized"
-            print(f"Player {player_id} authorized via 2FA")
+            print(f"Player {player_id} authorized via 2FA", flush=True)
             return jsonify({"status": "authorized"})
-
         except Exception as e:
-            print(f"auth_password error: {e}")
+            print(f"auth_password error for player={player_id!r}: {repr(e)}", flush=True)
             return jsonify({"error": str(e)}), 500
 
     return jsonify({"error": "unexpected_state", "state": state}), 400
@@ -333,8 +328,7 @@ def auth_code():
 
 @app.route("/auth/status", methods=["GET"])
 def auth_status():
-    """Проверить статус авторизации игрока."""
-    if request.headers.get("X-Secret-Key") != SECRET_KEY:
+    if not require_secret():
         return jsonify({"error": "unauthorized"}), 401
 
     player_id = request.args.get("player_id", "").strip()
@@ -350,11 +344,7 @@ def auth_status():
 
 @app.route("/to-tg-user", methods=["POST"])
 def to_tg_user():
-    """
-    Отправить сообщение от имени авторизованного пользователя.
-    Тело: { "player_id": "uuid", "message": "текст" }
-    """
-    if request.headers.get("X-Secret-Key") != SECRET_KEY:
+    if not require_secret():
         return jsonify({"error": "unauthorized"}), 401
 
     data = request.get_json(silent=True) or {}
@@ -378,17 +368,14 @@ def to_tg_user():
 
         run_async(player_id, do_send())
         return jsonify({"ok": True})
-
     except Exception as e:
-        print(f"to-tg-user error: {e}")
+        print(f"to-tg-user error for player={player_id!r}: {repr(e)}", flush=True)
         return jsonify({"error": str(e)}), 500
 
 
-# ── Существующие эндпоинты ────────────────────────────────────────────────────
-
 @app.route("/to-tg", methods=["POST"])
 def to_tg():
-    if request.headers.get("X-Secret-Key") != SECRET_KEY:
+    if not require_secret():
         return jsonify({"error": "unauthorized"}), 401
 
     data = request.get_json(silent=True)
@@ -400,7 +387,7 @@ def to_tg():
         rr = requests.post(
             f"https://api.telegram.org/bot{TOKEN}/sendMessage",
             json={"chat_id": CHAT_ID, "text": text, "parse_mode": "Markdown"},
-            timeout=20
+            timeout=20,
         )
         if rr.status_code != 200:
             return jsonify({"error": "telegram send failed", "body": rr.text}), 502
@@ -411,7 +398,7 @@ def to_tg():
 
 @app.route("/from-tg", methods=["GET"])
 def from_tg():
-    if request.headers.get("X-Secret-Key") != SECRET_KEY:
+    if not require_secret():
         return jsonify({"error": "unauthorized"}), 401
 
     with lock:
@@ -423,13 +410,13 @@ def from_tg():
 @app.route("/health", methods=["GET"])
 def health():
     with auth_lock:
-        authorized_count = sum(
-            1 for s in auth_sessions.values() if s.get("state") == "authorized"
-        )
+        authorized_count = sum(1 for s in auth_sessions.values() if s.get("state") == "authorized")
+        waiting_count = sum(1 for s in auth_sessions.values() if s.get("state") in ("wait_code", "wait_password"))
     return jsonify({
         "status": "ok",
         "pid": os.getpid(),
-        "authorized_users": authorized_count
+        "authorized_users": authorized_count,
+        "waiting_users": waiting_count,
     })
 
 
@@ -440,4 +427,4 @@ def _boot_once():
 
 if __name__ == "__main__":
     ensure_single_poller()
-    app.run(host="0.0.0.0", port=5000)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "5000")))

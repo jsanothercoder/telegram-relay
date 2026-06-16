@@ -2,3 +2,4 @@ flask
 requests
 redis
 gunicorn
+telethon

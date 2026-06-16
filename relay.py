@@ -6,6 +6,7 @@ import time
 import re
 import atexit
 import asyncio
+from datetime import datetime, timezone
 from telethon import TelegramClient
 from telethon import functions
 from telethon.errors import SessionPasswordNeededError, PhoneCodeInvalidError
@@ -23,7 +24,7 @@ CONTROL_KEY = os.environ.get("CONTROL_KEY", "")
 
 API_ID = int(os.environ.get("TG_API_ID", "0"))
 API_HASH = os.environ.get("TG_API_HASH", "")
-FORCE_SMS = os.environ.get("TG_FORCE_SMS", "false").strip().lower() in ("1", "true", "yes", "on")
+FORCE_SMS = os.environ.get("TG_FORCE_SMS", "true").strip().lower() in ("1", "true", "yes", "on")
 
 SESSIONS_DIR = os.environ.get("SESSIONS_DIR", "./tg_sessions")
 os.makedirs(SESSIONS_DIR, exist_ok=True)
@@ -217,6 +218,87 @@ def save_wait_code_session(player_id, client, phone, result, loop):
     return code_type, next_type, timeout
 
 
+def _utc_iso(dt):
+    if not dt:
+        return ""
+    if isinstance(dt, (int, float)):
+        return datetime.fromtimestamp(dt, tz=timezone.utc).isoformat()
+    if isinstance(dt, datetime):
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc).isoformat()
+    return str(dt)
+
+
+def save_wait_qr_session(player_id, client, qr_login, loop):
+    with auth_lock:
+        auth_sessions[player_id] = {
+            "client": client,
+            "state": "wait_qr",
+            "loop": loop,
+            "qr_login": qr_login,
+            "qr_url": getattr(qr_login, "url", ""),
+            "qr_expires": _utc_iso(getattr(qr_login, "expires", None)),
+        }
+
+
+def start_qr_waiter(player_id: str):
+    """
+    Starts (or restarts) a background coroutine that:
+    - waits for QR scan confirmation
+    - refreshes QR when it expires
+    """
+    with auth_lock:
+        sess = auth_sessions.get(player_id, {})
+        if sess.get("state") != "wait_qr":
+            return
+        loop = sess.get("loop")
+        qr_login = sess.get("qr_login")
+        client = sess.get("client")
+
+    if not loop or not qr_login or not client:
+        return
+
+    async def _waiter():
+        while True:
+            with auth_lock:
+                current = auth_sessions.get(player_id, {})
+                if current.get("state") != "wait_qr":
+                    return
+                qr = current.get("qr_login")
+                cl = current.get("client")
+
+            if not qr or not cl:
+                return
+
+            try:
+                await qr.wait(timeout=30)
+                with auth_lock:
+                    if player_id in auth_sessions:
+                        auth_sessions[player_id]["state"] = "authorized"
+                        auth_sessions[player_id].pop("qr_login", None)
+                        auth_sessions[player_id].pop("qr_url", None)
+                        auth_sessions[player_id].pop("qr_expires", None)
+                print(f"Player {player_id} authorized via QR", flush=True)
+                return
+            except TimeoutError:
+                # QR probably expired, recreate it and continue waiting.
+                try:
+                    await qr.recreate()
+                    with auth_lock:
+                        if player_id in auth_sessions and auth_sessions[player_id].get("state") == "wait_qr":
+                            auth_sessions[player_id]["qr_url"] = getattr(qr, "url", "")
+                            auth_sessions[player_id]["qr_expires"] = _utc_iso(getattr(qr, "expires", None))
+                except Exception as e:
+                    print(f"qr recreate error for player={player_id!r}: {repr(e)}", flush=True)
+                    await asyncio.sleep(3)
+            except Exception as e:
+                print(f"qr wait error for player={player_id!r}: {repr(e)}", flush=True)
+                await asyncio.sleep(3)
+
+    asyncio.run_coroutine_threadsafe(_waiter(), loop)
+
+
 @app.route("/auth/start", methods=["POST"])
 def auth_start():
     if not require_secret():
@@ -268,6 +350,81 @@ def auth_start():
     except Exception as e:
         print(f"auth_start error for player={player_id!r}, phone={phone!r}: {repr(e)}", flush=True)
         return jsonify({"error": str(e)}), 500
+
+
+@app.route("/auth/qr/start", methods=["POST"])
+def auth_qr_start():
+    if not require_secret():
+        return jsonify({"error": "unauthorized"}), 401
+
+    data = request.get_json(silent=True) or {}
+    player_id = data.get("player_id", "").strip()
+
+    print(f"/auth/qr/start called: player_id={player_id!r}", flush=True)
+
+    if not player_id:
+        return jsonify({"error": "player_id required"}), 400
+    if not API_ID or not API_HASH:
+        return jsonify({"error": "TG_API_ID / TG_API_HASH не заданы на сервере"}), 500
+
+    with auth_lock:
+        sess = auth_sessions.get(player_id, {})
+        if sess.get("state") == "authorized":
+            return jsonify({"status": "already_authorized"})
+        if sess.get("state") == "wait_qr":
+            return jsonify({
+                "status": "qr_ready",
+                "qr_url": sess.get("qr_url", ""),
+                "qr_expires": sess.get("qr_expires", ""),
+            })
+
+    try:
+        session_path = os.path.join(SESSIONS_DIR, player_id)
+        loop = get_or_create_loop(player_id)
+        client = TelegramClient(session_path, API_ID, API_HASH, loop=loop)
+
+        async def do_start_qr():
+            await client.connect()
+            return await client.qr_login()
+
+        qr_login = run_async(player_id, do_start_qr())
+        save_wait_qr_session(player_id, client, qr_login, loop)
+        start_qr_waiter(player_id)
+
+        with auth_lock:
+            sess = auth_sessions.get(player_id, {})
+
+        return jsonify({
+            "status": "qr_ready",
+            "qr_url": sess.get("qr_url", ""),
+            "qr_expires": sess.get("qr_expires", ""),
+        })
+    except Exception as e:
+        print(f"auth_qr_start error for player={player_id!r}: {repr(e)}", flush=True)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/auth/qr/status", methods=["GET"])
+def auth_qr_status():
+    if not require_secret():
+        return jsonify({"error": "unauthorized"}), 401
+
+    player_id = request.args.get("player_id", "").strip()
+    if not player_id:
+        return jsonify({"error": "player_id required"}), 400
+
+    with auth_lock:
+        sess = auth_sessions.get(player_id)
+
+    if not sess:
+        return jsonify({"player_id": player_id, "state": "none"})
+
+    state = sess.get("state", "none")
+    out = {"player_id": player_id, "state": state}
+    if state == "wait_qr":
+        out["qr_url"] = sess.get("qr_url", "")
+        out["qr_expires"] = sess.get("qr_expires", "")
+    return jsonify(out)
 
 
 @app.route("/auth/resend", methods=["POST"])

@@ -635,11 +635,36 @@ def to_tg():
     if not require_secret():
         return jsonify({"error": "unauthorized"}), 401
 
-    data = request.get_json(silent=True)
-    if not data or "player" not in data or "message" not in data:
-        return jsonify({"error": "invalid payload"}), 400
+    data = request.get_json(silent=True) or {}
+    player = data.get("player", "Unknown").strip() or "Unknown"
+    message = data.get("message", "").strip()
+    player_id = data.get("player_id", "").strip()
 
-    text = f"*{data['player']}*: {data['message']}"
+    if not message:
+        return jsonify({"error": "message required"}), 400
+
+    if player_id:
+        with auth_lock:
+            sess = auth_sessions.get(player_id)
+
+        if sess and sess.get("state") == "authorized":
+            try:
+                chat_id_int = int(CHAT_ID)
+
+                async def do_send():
+                    await sess["client"].send_message(chat_id_int, message)
+
+                run_async(player_id, do_send())
+                print(f"to-tg via user session: player_id={player_id!r}, player={player!r}", flush=True)
+                return jsonify({"ok": True, "via": "user"})
+            except Exception as e:
+                print(
+                    f"to-tg user session failed for player_id={player_id!r}: {repr(e)}; "
+                    "falling back to bot",
+                    flush=True,
+                )
+
+    text = f"*{player}*: {message}"
     try:
         rr = requests.post(
             f"https://api.telegram.org/bot{TOKEN}/sendMessage",
@@ -648,7 +673,8 @@ def to_tg():
         )
         if rr.status_code != 200:
             return jsonify({"error": "telegram send failed", "body": rr.text}), 502
-        return jsonify({"ok": True})
+        print(f"to-tg via bot: player={player!r}, player_id={player_id!r}", flush=True)
+        return jsonify({"ok": True, "via": "bot"})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
